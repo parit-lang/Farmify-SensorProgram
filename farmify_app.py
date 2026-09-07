@@ -363,8 +363,8 @@ PAGE = r"""<!doctype html>
     max-width: 580px; margin: 2.5rem auto; padding: 0 1.25rem;
     background: #f7f8f6; color: #1c2118;
   }
-  header { display: flex; align-items: flex-start; gap: 1rem; margin-bottom: 1.5rem; }
-  .titles { flex: 1; }
+  header { display: flex; align-items: flex-start; gap: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
+  .titles { flex: 1; min-width: 12rem; }
   h1 { font-size: 1.4rem; margin: 0 0 .3rem; }
   .sub { margin: 0; font-size: .85rem; color: #6d7566; }
   .box {
@@ -377,15 +377,15 @@ PAGE = r"""<!doctype html>
     border: 1px solid #c6cdbf; border-radius: 6px;
     background: #fdfdfc; color: inherit; font-family: inherit;
   }
-  input:focus { outline: 2px solid #4a7c3f; outline-offset: 1px; }
+  input:focus { outline: 2px solid #307A9C; outline-offset: 1px; }
   button {
     font-family: inherit; font-weight: 600; border: 0; border-radius: 6px;
-    background: #4a7c3f; color: #fff; cursor: pointer;
+    background: #307A9C; color: #fff; cursor: pointer;
   }
-  button:hover:not(:disabled) { background: #3d6834; }
+  button:hover:not(:disabled) { background: #0F5373; }
   button:disabled { opacity: .55; cursor: default; }
-  #start { width: 100%; padding: .7rem; font-size: 1rem; }
-  #bt, #dis { padding: .5rem .8rem; font-size: .82rem; white-space: nowrap; }
+  #start { width: 100%; padding: .85rem; font-size: 1rem; min-height: 44px; }
+  #bt, #dis { padding: .6rem .9rem; font-size: .85rem; white-space: nowrap; min-height: 44px; }
   #dis { margin-left: .35rem; background: transparent; color: #6d7566;
          border: 1px solid #c6cdbf; }
   #dis:hover:not(:disabled) { background: #f0f2ee; color: #a4342a; border-color: #c9a19b; }
@@ -406,6 +406,17 @@ PAGE = r"""<!doctype html>
   }
   .muted { color: #6d7566; }
   .err { color: #a4342a; }
+  .site-footer {
+    display: flex; align-items: center; gap: .85rem; flex-wrap: wrap;
+    margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #d9ded4;
+    font-size: .8rem; color: #6d7566;
+  }
+  .footer-logo {
+    width: 2rem; height: 2rem; flex-shrink: 0; object-fit: contain;
+  }
+  .footer-info p { margin: 0 0 .2rem; }
+  .footer-info a { color: #307A9C; text-decoration: none; }
+  .footer-info a:hover { color: #0F5373; text-decoration: underline; }
   @media (prefers-color-scheme: dark) {
     body { background: #14170f; color: #e6e9e0; }
     .box { background: #1d2117; border-color: #333a2b; }
@@ -414,6 +425,17 @@ PAGE = r"""<!doctype html>
     #dis:hover:not(:disabled) { background: #262b1e; color: #e88b7f; border-color: #5a4038; }
     .muted, .sub, .pill { color: #8d9683; }
     .err { color: #e88b7f; }
+    .site-footer { border-color: #333a2b; color: #8d9683; }
+    .footer-info a { color: #6fb3d9; }
+    .footer-info a:hover { color: #9ccbe6; }
+  }
+  @media (max-width: 480px) {
+    body { margin: 1.25rem auto; padding: 0 1rem; }
+    header { flex-direction: column; align-items: stretch; gap: .75rem; margin-bottom: 1.15rem; }
+    .btwrap { display: flex; flex-wrap: wrap; gap: .5rem; text-align: left; }
+    #bt, #dis { flex: 1; margin-left: 0; }
+    .pill { flex-basis: 100%; max-width: 100%; margin-top: .2rem; }
+    .box { padding: .9rem 1rem; }
   }
 </style>
 </head>
@@ -444,6 +466,14 @@ PAGE = r"""<!doctype html>
   <span class="lbl">Result</span>
   <pre id="result" class="muted">No reading yet.</pre>
 </div>
+
+<footer class="site-footer">
+  <img class="footer-logo" src="assets/logo.png" alt="Farmify logo">
+  <div class="footer-info">
+    <p><a href="https://www.farmify.us" target="_blank" rel="noopener">www.farmify.us</a></p>
+    <p>contact@farmify.example &middot; (555) 012-3456</p>
+  </div>
+</footer>
 
 <script>
 'use strict';
