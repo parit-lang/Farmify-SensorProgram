@@ -22,6 +22,10 @@ Needs pyserial (pip install pyserial). Everything else is the standard library.
 """
 
 import json
+<<<<<<< Updated upstream
+=======
+import random
+>>>>>>> Stashed changes
 import sys
 import threading
 import time
@@ -372,6 +376,44 @@ def ranges_for(crop: str):
     return CROP_RANGES.get(ALIASES.get(key, key))
 
 
+# Fallback bounds for demo mode, used only where a crop's own sheet leaves a
+# channel unbounded on one or both sides — so a simulated reading always has
+# somewhere plausible to land, even for a crop with no target for that channel.
+_DEMO_FALLBACK_RANGE = {
+    'moisture_pct': (25, 85), 'temperature_c': (12, 34), 'ec_ds_m': (0.4, 3.2),
+    'ph': (5.2, 7.6), 'nitrogen_mg_kg': (30, 250), 'phosphorus_mg_kg': (15, 90),
+    'potassium_mg_kg': (60, 280),
+}
+
+_DEMO_DECIMALS = {
+    'moisture_pct': 1, 'temperature_c': 1, 'ec_ds_m': 2, 'ph': 1,
+    'nitrogen_mg_kg': 0, 'phosphorus_mg_kg': 0, 'potassium_mg_kg': 0,
+}
+
+
+def simulate_reading(ranges: dict | None) -> dict:
+    """A believable reading with no hardware and no live radio involved.
+
+    Lands inside the crop's ideal range most of the time, so a first-time demo
+    reads as healthy, but each channel has a small chance of drifting outside
+    it so the demo can also show what an out-of-range verdict looks like.
+    """
+    reading = {}
+    for name in CHANNELS:
+        span = (ranges or {}).get(name)
+        fallback_low, fallback_high = _DEMO_FALLBACK_RANGE[name]
+        low = fallback_low if not span or span[0] is None else span[0]
+        high = fallback_high if not span or span[1] is None else span[1]
+        if random.random() < 0.85:
+            value = random.uniform(low, high)
+        else:
+            pad = (high - low) * 0.25 or 1
+            value = (random.uniform(low - pad, low) if random.random() < 0.5
+                     else random.uniform(high, high + pad))
+        reading[name] = round(value, _DEMO_DECIMALS[name])
+    return reading
+
+
 def assess(reading: dict, ranges: dict) -> dict:
     """Judge each channel against its ideal range: too low, too high, or good."""
     verdicts = {}
@@ -388,17 +430,6 @@ def assess(reading: dict, ranges: dict) -> dict:
         else:
             verdicts[LABELS[name]] = 'good'
     return verdicts
-
-
-def format_reading(reading: dict) -> str:
-    return '\n'.join(
-        f'  {name:<18} {value:>8} {UNITS[name]}'.rstrip()
-        for name, value in reading.items()
-    )
-
-
-def format_assessment(verdicts: dict) -> str:
-    return '\n'.join(f'  {label} {verdict}' for label, verdict in verdicts.items())
 
 
 # ------------------------------------------------------------ connection state
@@ -467,10 +498,24 @@ PAGE = r"""<!doctype html>
     max-width: 580px; margin: 2.5rem auto; padding: 0 1.25rem;
     background: #f7f8f6; color: #1c2118;
   }
-  header { display: flex; align-items: flex-start; gap: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
+  header { display: flex; align-items: flex-start; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; }
   .titles { flex: 1; min-width: 12rem; }
   h1 { font-size: 1.4rem; margin: 0 0 .3rem; }
   .sub { margin: 0; font-size: .85rem; color: #6d7566; }
+  .mode-switch { display: flex; align-items: center; gap: .5rem; }
+  .switch-label { font-weight: 600; font-size: .85rem; }
+  .switch { position: relative; display: inline-block; width: 2.6rem; height: 1.5rem; flex-shrink: 0; }
+  .switch input {
+    position: absolute; inset: 0; width: 100%; height: 100%; margin: 0;
+    opacity: 0; cursor: pointer; z-index: 1;
+  }
+  .switch-track { position: absolute; inset: 0; background: #c6cdbf; border-radius: 999px; transition: background .15s; }
+  .switch-track::before {
+    content: ''; position: absolute; width: 1.15rem; height: 1.15rem; left: .18rem; top: .17rem;
+    background: #fff; border-radius: 50%; transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.25);
+  }
+  .switch input:checked + .switch-track { background: #c98a1f; }
+  .switch input:checked + .switch-track::before { transform: translateX(1.1rem); }
   .box {
     background: #fff; border: 1px solid #d9ded4; border-radius: 10px;
     padding: 1rem 1.15rem; margin-bottom: 1rem;
@@ -490,56 +535,88 @@ PAGE = r"""<!doctype html>
   button:disabled { opacity: .55; cursor: default; }
   #start { width: 100%; padding: .85rem; font-size: 1rem; min-height: 44px; }
   #bt, #dis { padding: .6rem .9rem; font-size: .85rem; white-space: nowrap; min-height: 44px; }
-  #dis { margin-left: .35rem; background: transparent; color: #6d7566;
-         border: 1px solid #c6cdbf; }
+  #dis { background: transparent; color: #6d7566; border: 1px solid #c6cdbf; }
   #dis:hover:not(:disabled) { background: #f0f2ee; color: #a4342a; border-color: #c9a19b; }
-  .btwrap { text-align: right; }
+  .btwrap { display: flex; gap: .5rem; align-items: center; }
   [hidden] { display: none !important; }
-  .pill {
-    display: inline-block; margin-top: .4rem; font-size: .74rem;
-    color: #6d7566; max-width: 15rem;
+  .mode-banner {
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .6rem;
+    background: #fff; border: 1px solid #d9ded4; border-left: 4px solid #b3bba9; border-radius: 10px;
+    padding: .75rem 1rem; margin-bottom: 1rem; font-size: .88rem; font-weight: 600;
   }
+  .mode-banner-text { display: flex; align-items: center; }
+  .mode-banner.connected { border-left-color: #4a7c3f; }
+  .mode-banner.demo { border-left-color: #c98a1f; background: #fdf6e8; }
   .dot { display: inline-block; width: .5rem; height: .5rem; border-radius: 50%;
-         background: #b3bba9; margin-right: .3rem; vertical-align: middle; }
+         background: #b3bba9; margin-right: .3rem; vertical-align: middle; flex-shrink: 0; }
   .dot.on { background: #4a7c3f; }
   .dot.bad { background: #a4342a; }
-  pre {
-    margin: 0; white-space: pre-wrap; word-break: break-word;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: .875rem; line-height: 1.5; min-height: 1.2em;
+  .dot.demo { background: #c98a1f; }
+  .demo-tag {
+    background: #fbe7bf; color: #7a4b00; font-weight: 700; font-size: .68rem;
+    padding: .2rem .55rem; border-radius: 999px; text-transform: uppercase; letter-spacing: .03em;
   }
+  .result-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: .5rem; }
+  .result-head .lbl { margin-bottom: 0; }
+  .result-summary { margin: 0 0 .75rem; font-weight: 600; }
+  .result-summary.good { color: #2f6b3d; }
+  .result-summary.warn { color: #8a5a00; }
+  .rows { display: flex; flex-direction: column; gap: .4rem; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+         padding: .5rem .6rem; background: #f7f8f6; border-radius: 8px; }
+  .row-label { font-weight: 600; flex: 1; min-width: 6rem; }
+  .row-value { font-variant-numeric: tabular-nums; }
+  .chip { font-size: .72rem; font-weight: 700; padding: .15rem .5rem; border-radius: 999px; white-space: nowrap; }
+  .chip-good { background: #e3f0e1; color: #2f6b3d; }
+  .chip-low { background: #fdecc8; color: #8a5a00; }
+  .chip-high { background: #f7dcd8; color: #a4342a; }
+  .chip-muted { background: #e7e9e3; color: #6d7566; }
   .muted { color: #6d7566; }
   .err { color: #a4342a; }
   .site-footer {
-    display: flex; align-items: center; gap: .85rem; flex-wrap: wrap;
+    display: flex; flex-direction: column; align-items: flex-start; gap: .5rem;
     margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #d9ded4;
     font-size: .8rem; color: #6d7566;
   }
-  .footer-logo {
-    width: 2rem; height: 2rem; flex-shrink: 0; object-fit: contain;
+  .footer-badge {
+    display: inline-block; background: #e7f1f5; color: #0F5373;
+    font-weight: 600; font-size: .72rem; padding: .25rem .6rem; border-radius: 999px;
   }
   .footer-info p { margin: 0 0 .2rem; }
-  .footer-info a { color: #307A9C; text-decoration: none; }
-  .footer-info a:hover { color: #0F5373; text-decoration: underline; }
+  .footer-info a, .footer-legal a { color: #307A9C; text-decoration: none; }
+  .footer-info a:hover, .footer-legal a:hover { color: #0F5373; text-decoration: underline; }
+  .footer-legal, .footer-copy { margin: 0; }
   @media (prefers-color-scheme: dark) {
     body { background: #14170f; color: #e6e9e0; }
     .box { background: #1d2117; border-color: #333a2b; }
     input { background: #14170f; border-color: #3d4534; }
     #dis { color: #8d9683; border-color: #3d4534; }
     #dis:hover:not(:disabled) { background: #262b1e; color: #e88b7f; border-color: #5a4038; }
-    .muted, .sub, .pill { color: #8d9683; }
+    .muted, .sub { color: #8d9683; }
     .err { color: #e88b7f; }
     .site-footer { border-color: #333a2b; color: #8d9683; }
-    .footer-info a { color: #6fb3d9; }
-    .footer-info a:hover { color: #9ccbe6; }
+    .footer-badge { background: #1c3a47; color: #9ccbe6; }
+    .footer-info a, .footer-legal a { color: #6fb3d9; }
+    .footer-info a:hover, .footer-legal a:hover { color: #9ccbe6; }
+    .switch-track { background: #3d4534; }
+    .mode-banner { background: #1d2117; border-color: #333a2b; }
+    .mode-banner.demo { background: #2b2412; }
+    .demo-tag { background: #4a3a12; color: #f0c675; }
+    .result-summary.good { color: #8fd39d; }
+    .result-summary.warn { color: #e8b95c; }
+    .row { background: #232a1c; }
+    .chip-good { background: #203524; color: #8fd39d; }
+    .chip-low { background: #3a2c10; color: #e8b95c; }
+    .chip-high { background: #3a1f1c; color: #e88b7f; }
+    .chip-muted { background: #2a3020; color: #8d9683; }
   }
   @media (max-width: 480px) {
     body { margin: 1.25rem auto; padding: 0 1rem; }
     header { flex-direction: column; align-items: stretch; gap: .75rem; margin-bottom: 1.15rem; }
-    .btwrap { display: flex; flex-wrap: wrap; gap: .5rem; text-align: left; }
-    #bt, #dis { flex: 1; margin-left: 0; }
-    .pill { flex-basis: 100%; max-width: 100%; margin-top: .2rem; }
-    .box { padding: .9rem 1rem; }
+    .mode-banner { flex-direction: column; align-items: stretch; }
+    .btwrap { flex-wrap: wrap; }
+    #bt, #dis { flex: 1; }
+    .box, .mode-banner { padding: .9rem 1rem; }
   }
 </style>
 </head>
@@ -548,35 +625,53 @@ PAGE = r"""<!doctype html>
 <header>
   <div class="titles">
     <h1>Farmify Sensor</h1>
-    <p class="sub">Live soil readings over Bluetooth.</p>
+    <p class="sub">Live soil readings from your probe.</p>
   </div>
-  <div class="btwrap">
-    <button id="bt">Scan &amp; connect</button><button id="dis" hidden>Disconnect</button>
-    <div class="pill"><span class="dot" id="dot"></span><span id="status">Not connected</span></div>
+  <div class="mode-switch">
+    <label class="switch">
+      <input type="checkbox" id="demoToggle">
+      <span class="switch-track"></span>
+    </label>
+    <span class="switch-label">Demo Mode</span>
   </div>
 </header>
 
+<div class="mode-banner" id="modeBanner">
+  <div class="mode-banner-text"><span class="dot" id="dot"></span><span id="status">Not connected</span></div>
+  <div class="btwrap" id="liveControls">
+    <button id="bt">Scan &amp; connect</button><button id="dis" hidden>Disconnect</button>
+  </div>
+</div>
+
 <div class="box">
-  <label for="crop">Enter crop name</label>
+  <label class="lbl" for="crop">Choose your crop</label>
   <input id="crop" list="crops" placeholder="e.g. Corn" autocomplete="off" autofocus>
   <datalist id="crops"></datalist>
 </div>
 
 <div class="box">
+  <span class="lbl">Get a reading</span>
   <button id="start">Start</button>
 </div>
 
 <div class="box">
-  <span class="lbl">Result</span>
-  <pre id="result" class="muted">No reading yet.</pre>
+  <div class="result-head">
+    <span class="lbl">Soil Report</span>
+    <span class="demo-tag" id="demoTag" hidden>Simulated data</span>
+  </div>
+  <p class="result-summary muted" id="summary">No reading yet.</p>
+  <div class="rows" id="rows"></div>
 </div>
 
 <footer class="site-footer">
-  <img class="footer-logo" src="assets/logo.png" alt="Farmify logo">
+  <span class="footer-badge">Winner, 2026 Future Impact Challenge</span>
   <div class="footer-info">
     <p><a href="https://www.farmify.us" target="_blank" rel="noopener">www.farmify.us</a></p>
-    <p>contact@farmify.example &middot; (555) 012-3456</p>
+    <p>team@farmify.us</p>
+    <p>Built in the San Francisco Bay Area</p>
   </div>
+  <p class="footer-legal"><a href="#">Privacy Policy</a> &middot; <a href="#">Terms</a></p>
+  <p class="footer-copy">Farmify &copy; 2026. All rights reserved.</p>
 </footer>
 
 <script>
@@ -588,15 +683,17 @@ const disBtn = document.getElementById('dis');
 const startBtn = document.getElementById('start');
 const dot = document.getElementById('dot');
 const statusEl = document.getElementById('status');
-const out = document.getElementById('result');
+const modeBanner = document.getElementById('modeBanner');
+const liveControls = document.getElementById('liveControls');
+const demoToggle = document.getElementById('demoToggle');
+const demoTag = document.getElementById('demoTag');
+const summaryEl = document.getElementById('summary');
+const rowsEl = document.getElementById('rows');
+
+let demoMode = false;
 
 document.getElementById('crops').innerHTML =
   CROPS.map(c => `<option value="${c}">`).join('');
-
-function show(text, isError) {
-  out.className = isError ? 'err' : '';
-  out.textContent = text;
-}
 
 function setStatus(state, text) {
   dot.className = 'dot' + (state ? ' ' + state : '');
@@ -613,7 +710,9 @@ async function post(path, body) {
 }
 
 function applyStatus(s) {
+  if (demoMode) return;
   disBtn.hidden = !s.connected;
+  modeBanner.classList.toggle('connected', s.connected);
   if (s.connected) {
     const d = s.device || {};
     setStatus('on', `${d.name || 'connected'} (${d.address || ''})`);
@@ -624,14 +723,29 @@ function applyStatus(s) {
   }
 }
 
+function applyMode() {
+  modeBanner.classList.toggle('demo', demoMode);
+  liveControls.hidden = demoMode;
+  if (demoMode) {
+    modeBanner.classList.remove('connected');
+    setStatus('demo', 'Demo Mode — simulated data, no sensor needed');
+  } else {
+    post('/status').then(applyStatus).catch(() => {});
+  }
+}
+
+demoToggle.addEventListener('change', () => {
+  demoMode = demoToggle.checked;
+  applyMode();
+});
+
 async function disconnect() {
   disBtn.disabled = true;
   try {
     const r = await post('/disconnect');
     applyStatus(r.status);
-    show('Disconnected. The module is free for another device.', false);
   } catch (e) {
-    show('Could not reach the app: ' + e.message, true);
+    renderResult({ ok: false, output: 'Could not reach the app: ' + e.message });
   } finally {
     disBtn.disabled = false;
   }
@@ -644,34 +758,88 @@ async function scanConnect() {
     const r = await post('/connect');
     if (r.ok) {
       applyStatus(r.status);
-      show(`Connected to ${r.status.device.name} (${r.status.device.address}).`
-           + `\nEnter a crop name and press Start.`, false);
     } else {
       setStatus('bad', 'Not connected');
       btBtn.textContent = 'Scan & connect';
-      show(r.error, true);
+      renderResult({ ok: false, output: r.error });
     }
   } catch (e) {
     setStatus('bad', 'Not connected');
-    show('Could not reach the app: ' + e.message, true);
+    renderResult({ ok: false, output: 'Could not reach the app: ' + e.message });
   } finally {
     btBtn.disabled = false;
   }
 }
 
+function verdictClass(v) {
+  if (v === 'good') return 'chip-good';
+  if (v === 'too low') return 'chip-low';
+  if (v === 'too high') return 'chip-high';
+  return 'chip-muted';
+}
+
+function verdictText(v) {
+  if (v === 'good') return 'Good';
+  if (v === 'too low') return 'Too low';
+  if (v === 'too high') return 'Too high';
+  return 'No target';
+}
+
+const LABEL_DISPLAY = { ec: 'EC', ph: 'pH' };
+
+function displayLabel(label) {
+  return LABEL_DISPLAY[label] || (label.charAt(0).toUpperCase() + label.slice(1));
+}
+
+function renderResult(r) {
+  demoTag.hidden = !r.demo;
+
+  if (!r.ok) {
+    rowsEl.innerHTML = '';
+    summaryEl.className = 'result-summary err';
+    summaryEl.textContent = r.output;
+    return;
+  }
+
+  if (!r.has_ranges) {
+    summaryEl.className = 'result-summary muted';
+    summaryEl.textContent = `"${r.crop}" isn't in our crop dataset yet — showing raw readings.`;
+  } else {
+    const offCount = r.rows.filter(x => x.verdict !== 'good').length;
+    summaryEl.className = 'result-summary ' + (offCount ? 'warn' : 'good');
+    summaryEl.textContent = offCount
+      ? `${offCount} of ${r.rows.length} channels need attention.`
+      : `All ${r.rows.length} channels are in the ideal range.`;
+  }
+
+  rowsEl.innerHTML = r.rows.map(row => `
+    <div class="row">
+      <span class="row-label">${displayLabel(row.label)}</span>
+      <span class="row-value">${row.value}${row.unit ? ' ' + row.unit : ''}</span>
+      <span class="chip ${verdictClass(row.verdict)}">${verdictText(row.verdict)}</span>
+    </div>
+  `).join('');
+}
+
 async function start() {
   const crop = cropEl.value.trim();
-  if (!crop) { show('Enter a crop name first.', true); cropEl.focus(); return; }
+  if (!crop) {
+    renderResult({ ok: false, output: 'Enter a crop name first.' });
+    cropEl.focus();
+    return;
+  }
 
   startBtn.disabled = true;
-  out.className = 'muted';
-  out.textContent = 'Reading ' + crop + '…';
+  demoTag.hidden = true;
+  rowsEl.innerHTML = '';
+  summaryEl.className = 'result-summary muted';
+  summaryEl.textContent = 'Reading ' + crop + '…';
   try {
-    const r = await post('/read', { crop });
-    applyStatus(r.status);
-    show(r.output, !r.ok);
+    const r = await post('/read', { crop, demo: demoMode });
+    if (!demoMode) applyStatus(r.status);
+    renderResult(r);
   } catch (e) {
-    show('Could not reach the app: ' + e.message, true);
+    renderResult({ ok: false, output: 'Could not reach the app: ' + e.message });
   } finally {
     startBtn.disabled = false;
   }
@@ -697,19 +865,47 @@ def page() -> str:
 
 # ------------------------------------------------------------ http
 
-def do_read(crop: str) -> dict:
+def build_rows(reading: dict, ranges: dict | None) -> list:
+    """One row per channel, in display order, each carrying its own verdict."""
+    verdicts = assess(reading, ranges) if ranges else {}
+    return [
+        {
+            'label': LABELS[name],
+            'value': reading[name],
+            'unit': UNITS[name],
+            'verdict': verdicts.get(LABELS[name], 'no range listed'),
+        }
+        for name in CHANNELS
+    ]
+
+
+def do_read(crop: str, demo: bool = False) -> dict:
     if not crop:
         return {'ok': False, 'output': 'no crop type given'}
+<<<<<<< Updated upstream
     try:
         reading = LINK.read()
     except BridgeError as e:
         return {'ok': False, 'output': f'HC-12 link: {e}'}
+=======
+>>>>>>> Stashed changes
 
     ranges = ranges_for(crop)
-    body = [f'Crop: {crop}', format_reading(reading), '']
-    body.append(format_assessment(assess(reading, ranges)) if ranges
-                else '  crop not in our dataset sorry')
-    return {'ok': True, 'output': '\n'.join(body)}
+    if demo:
+        reading = simulate_reading(ranges)
+    else:
+        try:
+            reading = LINK.read()
+        except BridgeError as e:
+            return {'ok': False, 'output': f'HC-12 link: {e}'}
+
+    return {
+        'ok': True,
+        'demo': demo,
+        'crop': crop,
+        'has_ranges': ranges is not None,
+        'rows': build_rows(reading, ranges),
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -751,7 +947,9 @@ class Handler(BaseHTTPRequestHandler):
             LINK.disconnect()
             self._json({'ok': True, 'status': LINK.status()})
         elif self.path == '/read':
-            result = do_read(str(payload.get('crop', '')).strip())
+            crop = str(payload.get('crop', '')).strip()
+            demo = bool(payload.get('demo'))
+            result = do_read(crop, demo)
             self._json({**result, 'status': LINK.status()})
         else:
             self._send(404, 'not found', 'text/plain')
