@@ -1,25 +1,37 @@
 #!/usr/bin/env python3
 """Farmify — the sensor client and its web page in one file.
 
-Everything FarmifySensor.py does is built in here: the RFCOMM Bluetooth client,
-the crop range sheet, and the assessment. Nothing else needs to be installed or
-downloaded. Run it and open the address it prints.
+Everything FarmifySensor.py does is built in here: the HC-12 radio client, the
+crop range sheet, and the assessment. Nothing else needs to be downloaded. Run
+it and open the address it prints.
 
     python3 farmify_app.py
 
-The page has a Scan & connect button that runs a real Bluetooth Classic inquiry,
-picks out any HC-06 module in range, and holds the connection open. After that,
-Start pulls live values off the probe.
+    this program <--USB--> Nano + HC-12 <--433 MHz--> HC-12 + Uno --> soil probe
+
+The page has a Scan & connect button that walks the machine's USB serial ports
+asking each one to identify itself, and keeps the one that answers with the
+receiver's signature. After that, Start pulls live values off the probe over
+the air.
+
+Nothing about the receiver is hardcoded: no device path, and the gateway Uno's
+own USB port is never opened — it is treated as a board that happens to be
+plugged in for power. Every byte goes over the radio.
+
+Needs pyserial (pip install pyserial). Everything else is the standard library.
 """
 
 import json
-import re
-import socket
-import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    sys.exit('farmify_app.py needs pyserial: pip install pyserial')
 
 PORT = 8000
 
@@ -92,121 +104,225 @@ def parse_response(line: str) -> list[int]:
     return regs
 
 
-# ------------------------------------------------------------ bluetooth
+# ------------------------------------------------------------ radio link
 
-DEFAULT_CHANNEL = 1          # SPP is channel 1 on an HC-06
+PROBE = '!ID'
+SIGNATURE = 'FARMIFY-HC12-RX'
+
+DEFAULT_BAUD = 9600         # HC-12 factory default, and what the sketches use
+PROBE_TIMEOUT_S = 2.0
+
+# Opening a port asserts DTR, which pulses RESET on an Arduino. That cannot be
+# avoided: with DTR held low the FTDI on a Nano does not pass traffic at all, so
+# every open costs a reboot and every open has to wait one out.
+RESET_SETTLE_S = 2.0
+
 CONNECT_ATTEMPTS = 3
-CONNECT_BACKOFF_S = 2.5
-HC06_NAME = re.compile(r'hc[\s_-]?0?6', re.I)
-MAC = r'([0-9A-F]{2}(?::[0-9A-F]{2}){5})'
+CONNECT_BACKOFF_S = 2.0
+
+# A corrupted command reaches the gateway as an unknown one. The radio is a
+# lossy medium and a retry is nearly always enough, so it is worth one before
+# the error reaches the caller.
+COMMAND_ATTEMPTS = 3
 
 
-class BluetoothBridge:
-    """Client for the Arduino bridge over Bluetooth SPP."""
+class LinkError(BridgeError):
+    """The radio link itself failed: no carrier, no receiver, no reply at all.
 
-    def __init__(self, address, channel=DEFAULT_CHANNEL, timeout=8.0,
+    Separate from a plain BridgeError, which is what the gateway sends when it
+    was reached perfectly well and had bad news about the probe.
+    """
+
+
+class ReceiverNotFound(LinkError):
+    """No serial port answered the identity probe."""
+
+
+def _open(device, baud, timeout):
+    """Open a port and wait for the board behind it to finish rebooting."""
+    port = serial.Serial(device, baud, timeout=timeout)
+    time.sleep(RESET_SETTLE_S)
+    port.reset_input_buffer()
+    return port
+
+
+def _read_for(port, seconds, until=None):
+    deadline = time.monotonic() + seconds
+    buf = b''
+    while time.monotonic() < deadline:
+        buf += port.read(256)
+        if until is not None and until in buf:
+            break
+    return buf
+
+
+def candidate_ports():
+    """Serial ports worth probing, most-likely first.
+
+    Restricted to ports with a USB vendor ID, because a PC advertises dozens of
+    legacy ttyS* devices that no board is ever behind and each one costs a probe.
+    """
+    ports = list(serial.tools.list_ports.comports())
+    usb = [info.device for info in ports if info.vid is not None]
+    return usb or [info.device for info in ports]
+
+
+def identifies(device, baud=DEFAULT_BAUD, timeout=PROBE_TIMEOUT_S):
+    """Ask one port who it is, and say whether the receiver answered.
+
+    Raises PermissionError rather than swallowing it. A port the user cannot
+    open is a fixable problem with a specific fix, and reporting it as simply
+    "not the receiver" sends people looking at their wiring instead.
+    """
+    try:
+        with _open(device, baud, 0.2) as port:
+            port.write((PROBE + '\r\n').encode())
+            port.flush()
+            reply = _read_for(port, timeout, until=SIGNATURE.encode())
+    except PermissionError:
+        raise
+    except (OSError, serial.SerialException):
+        return False
+    return SIGNATURE.encode() in reply
+
+
+def find_receiver(baud=DEFAULT_BAUD, timeout=PROBE_TIMEOUT_S):
+    """Return the device path of the HC-12 receiver, or raise."""
+    ports = candidate_ports()
+    if not ports:
+        raise ReceiverNotFound('no serial ports on this machine at all')
+
+    denied = []
+    for device in ports:
+        try:
+            if identifies(device, baud, timeout):
+                return device
+        except PermissionError:
+            denied.append(device)
+
+    if denied:
+        raise ReceiverNotFound(
+            'permission denied opening {}. On Linux add yourself to the dialout '
+            'group (sudo usermod -aG dialout $USER) and log back in.'
+            .format(', '.join(denied)))
+    raise ReceiverNotFound(
+        'none of {} answered the identity probe. Check the Nano is plugged in '
+        'and running FarmifyHC12Rx.'.format(', '.join(ports)))
+
+
+def discover():
+    """Every USB serial port that could be the receiver.
+
+    Deliberately does not probe: this only backs the /scan endpoint, and
+    probing every port costs a board reset each. Same {address, name} shape the
+    page has always been given, so nothing on the front end has to change.
+    """
+    entries = []
+    for info in serial.tools.list_ports.comports():
+        if info.vid is None:
+            continue
+        entries.append({'address': info.device,
+                        'name': info.description or info.device})
+    return entries
+
+
+class HC12Bridge:
+    """Client for the Arduino gateway, reached over the HC-12 link."""
+
+    def __init__(self, port=None, baud=DEFAULT_BAUD, timeout=8.0,
                  attempts=CONNECT_ATTEMPTS, backoff=CONNECT_BACKOFF_S):
-        if not hasattr(socket, 'AF_BLUETOOTH'):
-            raise BridgeError(
-                'this Python was built without AF_BLUETOOTH and cannot open '
-                'RFCOMM sockets — rebuild the venv from /usr/bin/python3')
-        self.address = address
-        self.channel = channel
+        self.baud = baud
+        self.timeout = timeout
         self._buffer = b''
-        self._socket = self._connect(timeout, attempts, backoff)
-        self._socket.settimeout(timeout)
+        self.port = port or find_receiver(baud)
+        self._serial = self._connect(attempts, backoff)
+        self._prime()
 
-    def _connect(self, timeout, attempts, backoff):
+    def _connect(self, attempts, backoff):
         last = None
         for attempt in range(1, attempts + 1):
-            sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM,
-                                 socket.BTPROTO_RFCOMM)
-            sock.settimeout(timeout)
             try:
-                sock.connect((self.address, self.channel))
-                return sock
-            except OSError as e:
-                sock.close()
+                return _open(self.port, self.baud, 0.2)
+            except (OSError, serial.SerialException) as e:
                 last = e
                 if attempt < attempts:
                     time.sleep(backoff)
-        raise BridgeError(
-            f'could not connect to {self.address} after {attempts} attempts: '
-            f'{last}. Check the board is powered; an HC-06 also goes invisible '
-            f'while another device holds its single connection.')
+        raise LinkError(
+            f'could not open {self.port} after {attempts} attempts: {last}')
+
+    def _prime(self, attempts=3):
+        """Absorb the boot noise that follows the port opening.
+
+        Opening resets the receiver, and the first line it forwards is usually
+        the tail of whatever was in flight when RESET fired. command() retries
+        past that on its own, but the link is cleared once up front so the
+        first real reading does not pay for it.
+        """
+        for _ in range(attempts):
+            try:
+                if self._once('PING', wait=3.0) == 'PONG':
+                    return
+            except BridgeError:
+                pass
 
     def close(self):
-        if self._socket is not None:
-            try:
-                self._socket.close()
-            finally:
-                self._socket = None
+        if self._serial is not None:
+            self._serial.close()
+            self._serial = None
 
     def _readline(self, deadline):
         while b'\n' not in self._buffer:
             if time.monotonic() > deadline:
-                raise BridgeError('timed out waiting for a reply from the bridge')
-            try:
-                chunk = self._socket.recv(256)
-            except socket.timeout:
-                raise BridgeError('timed out waiting for a reply from the bridge')
+                raise LinkError('timed out waiting for a reply over the radio')
+            chunk = self._serial.read(256)
             if not chunk:
-                raise BridgeError('bridge closed the connection')
+                continue
             self._buffer += chunk
         line, self._buffer = self._buffer.split(b'\n', 1)
         return line.decode('utf-8', 'replace').strip()
 
-    def command(self, text, wait=6.0):
-        """Send one command and return its first non-empty reply line."""
+    def _once(self, text, wait):
         self._buffer = b''
-        self._socket.send(text.encode() + b'\r\n')
+        self._serial.reset_input_buffer()
+        self._serial.write(text.encode() + b'\r\n')
+        self._serial.flush()
         deadline = time.monotonic() + wait
         while True:
             line = self._readline(deadline)
             if line:
                 return line
 
+    def command(self, text, wait=6.0, attempts=COMMAND_ATTEMPTS):
+        """Send one command and return its first non-empty reply line."""
+        last = None
+        for attempt in range(1, attempts + 1):
+            try:
+                reply = self._once(text, wait)
+            except BridgeError as e:
+                last = e
+            else:
+                if not reply.startswith('ERR unknown command'):
+                    return reply
+                # Corruption on the air, not a gateway opinion: worth a resend.
+                last = LinkError(f'gateway did not understand {text!r}')
+            if attempt < attempts:
+                time.sleep(0.4)
+        raise last
+
+    def ping(self):
+        return self.command('PING') == 'PONG'
+
     def read(self):
-        return reading_from_registers(parse_response(self.command('READ')))
-
-
-def _run(cmd, timeout):
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ''
-
-
-def discover(timeout=20):
-    """Every Bluetooth Classic device in range, plus ones already paired.
-
-    Paired devices are folded in because an HC-06 stops answering inquiry while
-    something holds its single connection — it would otherwise vanish from the
-    list at exactly the moment you are using it.
-    """
-    found = {}
-    for line in _run(['bluetoothctl', 'devices'], 10).splitlines():
-        m = re.match(rf'Device\s+{MAC}\s+(.*)', line.strip(), re.I)
-        if m:
-            addr = m.group(1).upper()
-            found[addr] = {'address': addr, 'name': m.group(2).strip(),
-                           'paired': True, 'in_range': False}
-
-    for line in _run(['hcitool', 'scan', '--flush'], timeout).splitlines():
-        m = re.match(rf'{MAC}\s+(.*)', line.strip(), re.I)
-        if m:
-            addr = m.group(1).upper()
-            entry = found.setdefault(addr, {'address': addr, 'paired': False})
-            entry['name'] = m.group(2).strip()
-            entry['in_range'] = True
-
-    devices = list(found.values())
-    for d in devices:
-        d['is_hc06'] = bool(HC06_NAME.search(d.get('name', '')))
-    # in-range HC-06s first, then paired HC-06s, then everything else
-    devices.sort(key=lambda d: (not d['is_hc06'], not d['in_range'], d['name']))
-    return devices
+        last = None
+        for attempt in range(1, COMMAND_ATTEMPTS + 1):
+            try:
+                return reading_from_registers(
+                    parse_response(self.command('READ', attempts=1)))
+            except BridgeError as e:
+                last = e
+                if attempt < COMMAND_ATTEMPTS:
+                    time.sleep(0.4)
+        raise last
 
 
 # ------------------------------------------------------------ crop ideal ranges
@@ -305,21 +421,9 @@ class Link:
     def connect(self, address=None):
         with self._lock:
             self._drop()
-            device = None
-            if address:
-                found = [d for d in discover() if d['address'] == address.upper()]
-                device = found[0] if found else {'address': address.upper(),
-                                                 'name': address.upper()}
-            else:
-                candidates = [d for d in discover() if d['is_hc06']]
-                if not candidates:
-                    raise BridgeError(
-                        'no HC-06 module found. Check the board is powered and '
-                        'in range; an HC-06 also goes invisible while another '
-                        'device holds its single connection.')
-                device = candidates[0]
-
-            self._bridge = BluetoothBridge(device['address'])
+            port = address or find_receiver()
+            device = {'address': port, 'name': SIGNATURE}
+            self._bridge = HC12Bridge(port)
             self.device = device
             return device
 
@@ -599,7 +703,7 @@ def do_read(crop: str) -> dict:
     try:
         reading = LINK.read()
     except BridgeError as e:
-        return {'ok': False, 'output': f'Bluetooth bridge: {e}'}
+        return {'ok': False, 'output': f'HC-12 link: {e}'}
 
     ranges = ranges_for(crop)
     body = [f'Crop: {crop}', format_reading(reading), '']
@@ -657,9 +761,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    if not hasattr(socket, 'AF_BLUETOOTH'):
-        print('warning: this Python cannot open RFCOMM sockets; '
-              'connecting will fail', file=sys.stderr)
     print(f'Farmify -> http://localhost:{PORT}   (Ctrl-C to stop)')
     server = ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
     try:
